@@ -27,7 +27,7 @@ CORS(app, origins="*")
 class Config:
     DATASET_PATH = os.path.join('data', 'moodify_dataset.csv')
     MODEL_PATH = os.path.join('models', 'emotion-model')
-    PORT = int(os.environ.get('PORT', 5000))
+    PORT = int(os.environ.get('PORT', 8000))
     DEBUG = os.environ.get('FLASK_ENV') != 'production'
     
     # Spotify API credentials
@@ -296,90 +296,100 @@ mood_system = MoodMusicSystem(
 logger.info("✅ Mood system ready!")
 
 
-# LangGraph Workflow with Two Models
-def create_advanced_langgraph_workflow(mood_system):
+def create_multi_agent_workflow(mood_system):
     
-    logger.info("Loading music feature extraction model...")
-    music_feature_model = pipeline(
-        "zero-shot-classification",
-        model="facebook/bart-large-mnli",
-        device=-1
-    )
-    logger.info("✅ Music feature model loaded!")
+    # Initialize LLM for song descriptions (using FLAN-T5 or similar)
+    logger.info("Loading LLM for song descriptions...")
+    try:
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+        
+        llm_model_name = "google/flan-t5-base"  # You can use "google/flan-t5-large" for better results
+        llm_tokenizer = AutoTokenizer.from_pretrained(llm_model_name)
+        llm_model = AutoModelForSeq2SeqLM.from_pretrained(llm_model_name)
+        
+        song_description_llm = pipeline(
+            "text2text-generation",
+            model=llm_model,
+            tokenizer=llm_tokenizer,
+            max_length=100,
+            device=-1
+        )
+        logger.info("✅ LLM loaded successfully!")
+    except Exception as e:
+        logger.error(f"Failed to load LLM: {str(e)}")
+        song_description_llm = None
     
-    # Node 1: Advanced Emotion Detection
-    def detect_emotion_node(state: MoodMusicState):
+    def agent_1_user_emotion(state: MoodMusicState):
+        """Agent 1: Analyze user's emotion and recommend songs"""
         try:
             emotion, confidence = mood_system.detect_emotion(state["user_input"])
+            mood = mood_system.map_emotion_to_mood(emotion)
+            
             state["detected_emotion"] = emotion
             state["emotion_confidence"] = confidence
-            state["error"] = None
-            logger.info(f"Detected: {emotion} ({confidence:.2f})")
-        except Exception as e:
-            state["error"] = f"Emotion detection failed: {str(e)}"
-        return state
-    
-    # Node 2: Music Preference Extraction
-    def extract_music_preferences_node(state: MoodMusicState):
-        if state["error"]:
-            return state
-        
-        try:
-            text = state["user_input"]
-            
-            # Use zero-shot classification to detect music preferences
-            candidate_labels = ["high energy", "calm", "danceable", "acoustic", "loud"]
-            result = music_feature_model(text, candidate_labels)
-            
-            state["song_features"] = {
-                "preferences": result["labels"][:3],
-                "scores": result["scores"][:3]
-            }
-            logger.info(f"Music preferences: {result['labels'][:3]}")
-        except Exception as e:
-            logger.warning(f"Music preference extraction failed: {str(e)}")
-            state["song_features"] = {"preferences": [], "scores": []}
-        
-        return state
-    
-    # Node 3: Song Recommendation
-    def recommend_songs_node(state: MoodMusicState):
-        if state["error"]:
-            return state
-        
-        try:
-            mood = mood_system.map_emotion_to_mood(state["detected_emotion"])
             state["mood"] = mood
+            state["error"] = None
             
-            preferences = state["song_features"].get("preferences", [])
-            
-            # Recommend songs using both emotion and preferences
-            songs = mood_system.recommend_songs(mood, limit=10, preferences=preferences)
+            # Get initial recommendations
+            songs = mood_system.recommend_songs(mood, limit=10)
             state["recommended_songs"] = songs
             
-            logger.info(f"Recommended {len(songs)} songs for mood: {mood}")
         except Exception as e:
-            state["error"] = f"Song recommendation failed: {str(e)}"
+            state["error"] = str(e)
         
+        return state
+    
+    def agent_2_song_description(state: MoodMusicState):
+        """Agent 2: Use LLM to generate descriptions about each song"""
+        if state["error"]:
+            return state
+        
+        enriched_songs = []
+        
+        for song in state["recommended_songs"]:
+            song_copy = song.copy()
+            
+            song_name = song.get('name', 'Unknown')
+            artist = song.get('artist', 'Unknown')
+            
+            # Create prompt for LLM
+            prompt = f"Describe the song '{song_name}' by {artist} in one sentence."
+            
+            try:
+                if song_description_llm:
+                    # Generate description using LLM
+                    result = song_description_llm(prompt, max_length=80, do_sample=False)
+                    description = result[0]['generated_text'].strip()
+                    song_copy['llm_description'] = description
+                    logger.info(f"Generated description for '{song_name}': {description}")
+                else:
+                    song_copy['llm_description'] = f"A song by {artist}"
+                    
+            except Exception as e:
+                logger.warning(f"Failed to generate description for {song_name}: {str(e)}")
+                song_copy['llm_description'] = f"A {state['mood']} song by {artist}"
+            
+            enriched_songs.append(song_copy)
+        
+        state["recommended_songs"] = enriched_songs
         return state
     
     # Build graph
     workflow = StateGraph(MoodMusicState)
-    workflow.add_node("detect_emotion", detect_emotion_node)
-    workflow.add_node("extract_music_prefs", extract_music_preferences_node)
-    workflow.add_node("recommend_songs", recommend_songs_node)
     
-    workflow.set_entry_point("detect_emotion")
-    workflow.add_edge("detect_emotion", "extract_music_prefs")
-    workflow.add_edge("extract_music_prefs", "recommend_songs")
-    workflow.add_edge("recommend_songs", END)
+    workflow.add_node("agent_1_user", agent_1_user_emotion)
+    workflow.add_node("agent_2_llm_description", agent_2_song_description)
+    
+    workflow.set_entry_point("agent_1_user")
+    workflow.add_edge("agent_1_user", "agent_2_llm_description")
+    workflow.add_edge("agent_2_llm_description", END)
     
     return workflow.compile()
 
 
 # Create LangGraph workflow
 logger.info("Creating LangGraph workflow...")
-langgraph_workflow = create_advanced_langgraph_workflow(mood_system)
+langgraph_workflow = create_multi_agent_workflow(mood_system)
 logger.info("✅ LangGraph workflow ready!")
 
 
