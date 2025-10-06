@@ -303,7 +303,7 @@ def create_multi_agent_workflow(mood_system):
     try:
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
         
-        llm_model_name = "google/flan-t5-large"  # You can use "google/flan-t5-large" for better results
+        llm_model_name = "google/flan-t5-base"  # You can use "google/flan-t5-large" for better results
         llm_tokenizer = AutoTokenizer.from_pretrained(llm_model_name)
         llm_model = AutoModelForSeq2SeqLM.from_pretrained(llm_model_name)
         
